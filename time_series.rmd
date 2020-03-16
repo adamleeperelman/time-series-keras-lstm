@@ -1,0 +1,565 @@
+---
+title: "Untitled"
+author: "adam"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r}
+# Core Tidyverse
+library(tidyverse)
+library(glue)
+library(forcats)
+
+# Time Series
+library(timetk)
+library(tidyquant)
+library(tibbletime)
+
+# Visualization
+library(cowplot)
+
+# Reprocessing
+library(recipes)
+
+# Sampling / Accuracy
+library(rsample)
+library(yardstick) 
+
+# Modeling
+library(keras)
+
+set.seed(42)
+```
+In this post we will examine making time series predictions for binary state system. Forecasting this dataset is challenging because of high short term variability as well as long-term irregularities evident in the cycles
+
+create dataset
+```{r}
+require(tidyverse)
+require(DescTools)
+
+ee <- seq(24) %>% scales::rescale(to = c(0,2*pi))
+
+y <- sin(ee+4)+0.5*sin(ee*2)+0.1*sin(ee*8)
+plot(y,type='l')
+
+library(chron)
+
+ydf <- data.frame(pdf=y,hours=seq(as.POSIXct("2010-01-01 00:00:00"), as.POSIXct("2010-01-01 23:00:00"), by="hour"))
+ggplot(ydf,aes(x = hours,y = pdf))+geom_line()
+
+```
+
+```{r}
+
+number_of_days <- 90
+yy <- rep(y,number_of_days) 
+ee2 <- seq(yy)%>% scales::rescale(to=c(0,2*pi))
+yyy <- yy+0.5*sin(ee2)
+plot(yyy,type='l')
+
+dfyyy <- data.frame(pdf=yyy,time=ymd_hm("2010-01-01 00:00")+lubridate::hours(seq(number_of_days*24)))
+ggplot(dfyyy,aes(x = time,y = pdf))+geom_line()
+
+ggplot(dfyyy,aes(x = time,y = ifelse(pdf>0.5,1,0)))+geom_line()+ylab("state")
+
+```
+
+
+```{r}
+#add random noise
+noise <- ifelse(rbernoulli(n = 24*number_of_days,p = 0.15),1,0)%>% smooth.spline(n = 24*number_of_days,spar = 0.4) 
+noise <- ifelse(noise$y>0.6,1,0)
+
+
+z <- ifelse(yyy>0.5,1,0)
+z[which(noise==1)] <- abs(1-z[which(noise==1)])
+
+require(lubridate)
+
+
+ind_m <- seq(from =1,to=24*number_of_days)
+ind_t <- ymd_h("2010-01-01 00")+lubridate::hours(ind_m)
+
+
+df <- data.frame(time=ind_t,state=z)
+ggplot(df,aes(x = time,y = state))+geom_line()
+```
+
+
+```{r}
+#omit Sunday
+df$state[weekdays(df$time) %like% "Sunday"] <- 0
+
+require(plotly)
+p <- ggplot(df,aes(x=time,y=state))+geom_line() 
+ggplotly(p)
+```
+
+```{r}
+x <- rle(df$state)$lengths
+ggplot(data.frame(rle=x,index=seq(x)),aes(x=index,y=rle))+geom_point()
+
+```
+
+
+```{r}
+#add sensor
+df <- df %>% mutate(sensor=map_dbl(state,function(x)rnorm(1,mean=x*2)))
+df <- df %>% mutate(dayofweek=Weekday(time))
+ggplot(df,aes(x=time,y=sensor))+geom_point()
+
+caret::confusionMatrix(table(sensor=ifelse(df$sensor>=1.1,1,0),df$state))
+ggplot(df %>% mutate(dayofweek=weekdays(time)),aes(x=time,y=sensor,col=state))+geom_point()+facet_wrap(~dayofweek)
+ggplot(df,aes(x=time,y=sensor,col=state))+geom_point()
+```
+
+
+```{r}
+# load("C:/Users/User/Desktop/earnix/df.rda")
+df <- df %>% dplyr::rename(index=time,value=state)
+dff <- df
+```
+
+```{r}
+p1 <- dff %>%
+    ggplot(aes(index, value)) +
+    geom_point(color = palette_light()[[1]], alpha = 0.5) +
+    theme_tq() +
+    labs(
+        title = "(Full Data Set)"
+    )
+
+p2 <- dff %>%
+    slice(100:250) %>% 
+    ggplot(aes(index, value)) +
+    geom_line(color = palette_light()[[1]], alpha = 0.5) +
+    geom_point(color = palette_light()[[1]]) +
+    geom_smooth(method = "loess", span = 0.2, se = FALSE) +
+    theme_tq() +
+    labs(
+        title = "(Zoomed In To Show Cycle)",
+        caption = "datasets"
+    )
+
+p_title <- ggdraw() + 
+    draw_label("state", size = 18, fontface = "bold", colour = palette_light()[[1]])
+
+plot_grid(p_title, p1, p2, ncol = 1, rel_heights = c(0.1, 1, 1))
+```
+
+```{r}
+tidy_acf <- function(data, value, lags = 0:20) {
+    
+    value_expr <- enquo(value)
+    
+    acf_values <- data %>%
+        pull(value) %>%
+        acf(lag.max = tail(lags, 1), plot = FALSE) %>%
+        .$acf %>%
+        .[,,1]
+    
+    ret <- tibble(acf = acf_values) %>%
+        rowid_to_column(var = "lag") %>%
+        mutate(lag = lag - 1) %>%
+        filter(lag %in% lags)
+    
+    return(ret)
+}
+
+max_lag <- 24 * 30
+
+dff %>%
+    tidy_acf(value, lags = 0:max_lag)
+```
+
+```{r}
+dff %>%
+    tidy_acf(value, lags = 0:max_lag) %>%
+    ggplot(aes(lag, acf)) +
+    geom_segment(aes(xend = lag, yend = 0), color = palette_light()[[1]]) +
+    geom_vline(xintercept = 168, size = 3,alpha=0.25, color = palette_light()[[2]]) +
+    annotate("text", label = "1 week mark", x = 168, y = 0.8, 
+             color = palette_light()[[2]], size = 6, hjust = 0) +
+    theme_tq() +
+    labs(title = "ACF: state")
+```
+
+```{r}
+dff %>%
+    tidy_acf(value, lags = 1:(24 * 8))%>%
+    ggplot(aes(lag, acf)) +
+    geom_vline(xintercept = 168, size = 3, color = palette_light()[[2]]) +
+    geom_segment(aes(xend = lag, yend = 0), color = palette_light()[[1]]) +
+    geom_point(color = palette_light()[[1]], size = 2) +
+    geom_label(aes(label = acf %>% round(2)), vjust = -1,
+              color = palette_light()[[1]]) +
+    annotate("text", label = "1 week mark", x = 168, y = 0.8, 
+             color = palette_light()[[2]], size = 5, hjust = 0) +
+    theme_tq() +
+    labs(title = "ACF: Sunspots",
+         subtitle = "Zoomed in on Lags 115 to 135")
+```
+
+```{r}
+optimal_lag_setting <- dff %>%
+    tidy_acf(value, lags = 2:(24 * 30)) %>%
+    filter(acf == max(acf)) %>%
+    pull(lag)
+
+optimal_lag_setting
+```
+Backtesting: time series cross validation
+When doing cross validation on sequential data, the time dependencies on preceding samples must be preserved. We can create a cross validation sampling plan by offsetting the window used to select sequential sub-samples. In essence, we’re creatively dealing with the fact that there’s no future test data available by creating multiple synthetic “futures” - a process often, esp. in finance, called “backtesting”.
+
+```{r}
+#Creating back-testing strategy
+periods_train <- 24 * 20
+periods_test  <- 24 * 7
+skip_span     <- 23
+
+rolling_origin_resamples <- rolling_origin(
+    dff,
+    initial    = periods_train,
+    assess     = periods_test,
+    cumulative = FALSE,
+    skip       = skip_span
+)
+
+rolling_origin_resamples
+```
+
+```{r}
+# Plotting function for a single split
+plot_split <- function(split, expand_y_axis = TRUE, alpha = 1, size = 1, base_size = 14) {
+    
+    # Manipulate data
+    train_tbl <- training(split) %>%
+        add_column(key = "training") 
+    
+    test_tbl  <- testing(split) %>%
+        add_column(key = "testing") 
+    
+    data_manipulated <- bind_rows(train_tbl, test_tbl) %>%
+        as_tbl_time(index = index) %>%
+        mutate(key = fct_relevel(key, "training", "testing"))
+        
+    # Collect attributes
+    train_time_summary <- train_tbl %>%
+        tk_index() %>%
+        tk_get_timeseries_summary()
+    
+    test_time_summary <- test_tbl %>%
+        tk_index() %>%
+        tk_get_timeseries_summary()
+    
+    # Visualize
+    g <- data_manipulated %>%
+        ggplot(aes(x = index, y = value, color = key)) +
+        geom_line(size = size, alpha = alpha) +
+        theme_tq(base_size = base_size) +
+        scale_color_tq() +
+        labs(
+            title    = glue("Split: {split$id}"),
+            subtitle = glue("{train_time_summary$start} to {test_time_summary$end}"),
+            y = "", x = ""
+        ) +
+        theme(legend.position = "none") 
+    
+    if (expand_y_axis) {
+        
+        dff_time_summary <- dff %>% 
+            tk_index() %>% 
+            tk_get_timeseries_summary()
+        
+        g <- g +
+            scale_x_datetime(limits = c(dff_time_summary$start,
+                                   dff_time_summary$end))
+    }
+    
+    return(g)
+}
+```
+
+```{r}
+rolling_origin_resamples$splits[[1]] %>%
+    plot_split(expand_y_axis = TRUE) +
+    theme(legend.position = "bottom")
+```
+
+```{r}
+# Plotting function that scales to all splits 
+plot_sampling_plan <- function(sampling_tbl, expand_y_axis = TRUE, 
+                               ncol = 3, alpha = 1, size = 1, base_size = 14, 
+                               title = "Sampling Plan") {
+    
+    # Map plot_split() to sampling_tbl
+    sampling_tbl_with_plots <- sampling_tbl %>%
+        mutate(gg_plots = map(splits, plot_split, 
+                              expand_y_axis = expand_y_axis,
+                              alpha = alpha, base_size = base_size))
+    
+    # Make plots with cowplot
+    plot_list <- sampling_tbl_with_plots$gg_plots 
+    
+    p_temp <- plot_list[[1]] + theme(legend.position = "bottom")
+    legend <- get_legend(p_temp)
+    
+    p_body  <- plot_grid(plotlist = plot_list, ncol = ncol)
+    
+    p_title <- ggdraw() + 
+        draw_label(title, size = 18, fontface = "bold", colour = palette_light()[[1]])
+    
+    g <- plot_grid(p_title, p_body, legend, ncol = 1, rel_heights = c(0.05, 1, 0.05))
+    
+    return(g)
+    
+}
+```
+
+```{r}
+rolling_origin_resamples %>% slice(seq(from=1,to=nrow(rolling_origin_resamples),by=8)) %>% 
+    plot_sampling_plan(expand_y_axis = T, ncol = 3, alpha = 1, size = 1, base_size = 10, 
+                       title = "Backtesting Strategy: Rolling Origin Sampling Plan")
+```
+
+```{r}
+rolling_origin_resamples %>% slice(1:9) %>% 
+    plot_sampling_plan(expand_y_axis = F, ncol = 3, alpha = 1, size = 1, base_size = 10, 
+                       title = "Backtesting Strategy: Zoomed In")
+```
+
+```{r}
+split    <- rolling_origin_resamples$splits[[1]]
+split_id <- rolling_origin_resamples$id[[1]]
+
+plot_split(split, expand_y_axis = FALSE, size = 0.5) +
+    theme(legend.position = "bottom") +
+    ggtitle(glue("Split: {split_id}"))
+```
+
+```{r}
+get_df_processed_tbl <- function(split){
+  df_trn <- training(split)
+  df_tst <- testing(split)
+
+  df <- bind_rows(
+    df_trn %>% add_column(key = "training"),
+    df_tst %>% add_column(key = "testing")
+  ) %>% 
+    as_tbl_time(index = index)
+
+  return(df)
+}
+
+```
+
+
+```{r}
+get_data <- function(df_processed_tbl,lag_setting,train_length){
+  # Training Set
+  lag_train_tbl <- df_processed_tbl %>%
+      mutate(value_lag = lag(value, n = lag_setting),
+             sensor_lag = lag(sensor,n=lag_setting)) %>%
+      filter(!is.na(value_lag)) %>%
+      filter(key == "training") %>%
+      tail(train_length)
+  
+  x_train_vec <- lag_train_tbl %>% dplyr::select(value_lag) %>% as.matrix
+  x_train_arr <- array(data = x_train_vec, dim = c(nrow(x_train_vec), 1, 1))
+  
+  x_aux_train_vec <- lag_train_tbl %>% 
+    dplyr::select(dayofweek,sensor) %>% 
+    fastDummies::dummy_cols(select_columns = "dayofweek",remove_selected_columns = T) %>% 
+    as.matrix
+  x_aux_train_arr <- array(data = x_aux_train_vec, dim = c(nrow(x_aux_train_vec),8))
+  
+  y_train_vec <- lag_train_tbl$value
+  y_train_arr <- array(data = y_train_vec, dim = c(length(y_train_vec), 1))
+  
+  # Testing Set
+  lag_test_tbl <- df_processed_tbl %>%
+      mutate(
+          value_lag = lag(value, n = lag_setting)
+      ) %>%
+      filter(!is.na(value_lag)) %>%
+      filter(key == "testing")
+  
+  x_test_vec <- lag_test_tbl %>% dplyr::select(value_lag) %>% as.matrix
+  x_test_arr <- array(data = x_test_vec, dim = c(nrow(x_test_vec), 1, 1))
+  
+  x_aux_test_vec <- lag_test_tbl %>% 
+    dplyr::select(dayofweek,sensor) %>% 
+    fastDummies::dummy_cols(select_columns = "dayofweek",remove_selected_columns = T) %>% 
+    as.matrix
+  x_aux_test_arr <- array(data = x_aux_test_vec, dim = c(nrow(x_aux_test_vec), 8))
+  
+  y_test_vec <- lag_test_tbl$value
+  y_test_arr <- array(data = y_test_vec, dim = c(length(y_test_vec), 1))
+  
+  return(list(x_train_arr=x_train_arr,
+              x_aux_train_arr=x_aux_train_arr,
+              y_train_arr=y_train_arr,
+              x_test_arr=x_test_arr,
+              x_aux_test_arr=x_aux_test_arr,
+              y_test_arr=y_test_arr))
+}
+
+
+```
+Recurrent neural networks
+When our data has a sequential structure, it is recurrent neural networks (RNNs) we use to model it.
+
+As of today, among RNNs, the best established architectures are the GRU (Gated Recurrent Unit) and the LSTM (Long Short Term Memory). For today, let’s not zoom in on what makes them special, but on what they have in common with the most stripped-down RNN: the basic recurrence structure.
+
+In contrast to the prototype of a neural network, often called Multilayer Perceptron (MLP), the RNN has a state that is carried on over time. This is nicely seen in this diagram from Goodfellow et al., a.k.a. the “bible of deep learning”:
+
+LSTMs are explicitly designed to avoid the long-term dependency problem. Remembering information for long periods of time is practically their default behavior, not something they struggle to learn!
+
+You can set RNN layers to be 'stateful', which means that the states computed for the samples in one batch will be reused as initial states for the samples in the next batch. This assumes a one-to-one mapping between samples in different successive batches.
+
+given a big Time Series, and spliting it into smaller sequences to construct an input matrix X. it is possible that the LSTM may find dependencies between the sequences only when you go for the stateful LSTM. Most of the problems can be solved with stateless LSTM so if you go for the stateful mode, make sure you really need it. In stateless mode, long term memory does not mean that the LSTM will remember the content of the previous batches.
+
+When the model is stateless, Keras allocates an array for the states of size output_dim (understand number of cells in your LSTM). At each sequence processing, this state array is reset.
+
+In Stateful model, Keras must propagate the previous states for each sample across the batches. Referring to the explanation above, a sample at index i in batch #1 (Xi+bs) will know the states of the sample i in batch #0 (Xi).
+```{r}
+get_model <- function(batch_size=24,tsteps=1){
+  #LSTM Model
+        
+        lstm_input <- layer_input(batch_shape =  list(batch_size,tsteps,1),name = "lstm_input")
+        lstm_output <- lstm_input %>%
+            bidirectional(layer_lstm(units            = 50, 
+                       input_shape      = c(tsteps, 1), 
+                       batch_size       = batch_size,
+                       return_sequences = TRUE, 
+                       stateful         = TRUE)) %>% 
+            bidirectional(layer_lstm(units            = 50, 
+                       return_sequences = FALSE, 
+                       stateful         = TRUE) )
+    
+    
+        aux_input <- layer_input(batch_shape = c(batch_size,8),name="aux_input")
+        
+        output_layer <- layer_concatenate(c(aux_input,lstm_output)) %>% 
+           layer_dense(units = 1, activation = 'sigmoid', name = 'main_output')
+        
+        model <- keras_model(
+          inputs = c(lstm_input, aux_input), 
+          outputs = c(output_layer)
+        )
+        
+        model %>% 
+            compile(loss = 'binary_crossentropy',
+          optimizer = 'adam',
+          metrics = c('binary_accuracy','acc'))
+        
+        return(model)
+}
+```
+
+
+```{r}
+predict_keras_lstm <- function(split, epochs = 30, ...) {
+    
+    lstm_prediction <- function(split, epochs, ...) {
+        
+        #LSTM Plan
+        lag_setting  <- 24 * 7 # = nrow(df_tst)
+        batch_size   <- 24
+        train_length <- 21*24
+        tsteps       <- 1
+        epochs       <- epochs
+        
+       #Data Setup
+        df_processed_tbl <- get_df_processed_tbl(split)
+        data <- get_data(df_processed_tbl = df_processed_tbl,lag_setting,train_length)
+      
+        #Model Setup
+        model <- get_model(batch_size,tsteps)
+                
+    
+        # Fit Model
+        for(i in 1:epochs){
+                      model %>%
+                      fit(x    = list(data$x_train_arr,data$x_aux_train_arr), 
+                          y          = data$y_train_arr, 
+                          validation_data=list(list(data$x_test_arr,data$x_aux_test_arr), data$y_test_arr),
+                          batch_size = batch_size,
+                          epochs     = 1, 
+                          verbose    = 1, 
+                          shuffle    = FALSE)
+            
+            model %>% reset_states()
+            cat("Epoch: ", i)
+        }
+        
+        # Make Predictions
+        pred_out <- model %>% 
+            predict(list(data$x_test_arr,data$x_aux_test_arr), batch_size = batch_size) %>% 
+          .[,1]
+        pred_out <- ifelse(pred_out>0.5,1,0)
+        
+        
+        # Combine actual data with predictions
+        tbl_1 <- training(split) %>%
+            add_column(key = "actual")
+        
+        tbl_2 <- testing(split) %>%
+            add_column(key = "actual")
+        
+        tbl_3 <- testing(split)  %>% mutate(value=pred_out) %>%
+            add_column(key = "predict")
+        
+        time_bind_rows <- function(data_1, data_2, index) {
+            index_expr <- enquo(index)
+            bind_rows(data_1, data_2) %>%
+                as_tbl_time(index = !! index_expr)
+        }
+        
+        ret <- list(tbl_1, tbl_2, tbl_3) %>%
+            reduce(time_bind_rows, index = index) %>%
+            arrange(key, index) %>%
+            mutate(key = as_factor(key))
+        
+        return(ret)
+                
+        }
+    
+    #make safe model    
+    safe_lstm <- possibly(lstm_prediction, otherwise = NA)
+    
+    safe_lstm(split, epochs, ...)
+    
+}
+```
+
+```{r}
+predict_keras_lstm(split, epochs = 10)
+```
+
+```{r, echo=FALSE}
+# map model on split
+sample_predictions_lstm_tbl <- rolling_origin_resamples %>%slice(1:10) %>% 
+     mutate(predict = map(splits, predict_keras_lstm, epochs = 10))
+```
+
+```{r}
+sample_predictions_lstm_tbl
+```
+Overfitting small batch ― When debugging a model, it is often useful to make quick tests to see if there is any major issue with the architecture of the model itself. In particular, in order to make sure that the model can be properly trained, a mini-batch is passed inside the network to see if it can overfit on it. If it cannot, it means that the model is either too complex or not complex enough to even overfit on a small batch, let alone a normal-sized training set.
+
+```{r}
+x <- sample_predictions_lstm_tbl$predict[[1]]
+y <- x %>% spread(key=key,value=value) %>% mutate(miss=ifelse(actual==predict,0,1)) %>% gather(key,value,-index,-sensor,-dayofweek,-miss)
+
+calc_miss <- function(split){
+ split %>% spread(key=key,value=value) %>% mutate(miss=ifelse(actual==predict,0,1)) %>% gather(key,value,-index,-sensor,-dayofweek,-miss)
+}
+z <- map(sample_predictions_lstm_tbl$predict,.f = calc_miss)
+ggplot(y,aes(x=index,y=value,color=miss))+geom_point()
+  
+```
